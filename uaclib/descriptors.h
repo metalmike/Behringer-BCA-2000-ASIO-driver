@@ -28,6 +28,7 @@
 
 class USBAudioDevice;
 class USBEndpoint;
+class USBFirmwareInterface;
 class USBAudioStreamingInterface;
 class USBAudioControlInterface;
 
@@ -130,6 +131,46 @@ public:
 	friend class USBAudioControlInterface;
 	friend class USBAudioStreamingInterface;
 };
+
+
+class USBFirmwareEndpoint : public USBEndpoint, public TElement<USBFirmwareEndpoint, TList<USBFirmwareEndpoint>>
+{
+public:
+	USB_ENDPOINT_DESCRIPTOR	m_descriptor;
+protected:
+//	USB_ENDPOINT_DESCRIPTOR	m_asDescriptor;
+	USBFirmwareInterface*		m_interface;
+public:
+	USBFirmwareEndpoint(USB_ENDPOINT_DESCRIPTOR* descriptor, USBFirmwareInterface* iface);
+	~USBFirmwareEndpoint() {}
+	void Destroy()
+	{ delete this; }
+	virtual bool SetCSDescriptor(USB_DESCRIPTOR_HEADER *csDescriptor);
+	friend class USBAudioDevice;
+	friend class USBAudioControlInterface;
+	friend class USBAudioStreamingInterface;
+};
+
+class USBFirmwareInterface : public USBAudioInterface, public TElement<USBFirmwareInterface, TList<USBFirmwareInterface>>
+{
+protected:
+	usb_as_g_interface_descriptor_2				m_asgDescriptor;
+	usb_format_type_2							m_formatDescriptor;
+	TList<USBFirmwareEndpoint>					m_endpointsList;
+	
+public:
+	USBFirmwareInterface(USB_INTERFACE_DESCRIPTOR* iface);
+	~USBFirmwareInterface() {}
+
+	void Destroy()
+	{ delete this; }
+
+	virtual bool SetCSDescriptor(USB_DESCRIPTOR_HEADER* csDescriptor);
+	virtual USBEndpoint* CreateEndpoint(USB_ENDPOINT_DESCRIPTOR* descriptor);
+
+	friend class USBAudioDevice;
+};
+
 
 class USBAudioControlInterface : public USBAudioInterface, public TElement<USBAudioControlInterface, TList<USBAudioControlInterface>>
 {

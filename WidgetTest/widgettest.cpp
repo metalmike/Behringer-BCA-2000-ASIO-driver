@@ -32,7 +32,7 @@ void debugPrintf(const char *szFormat, ...)
     vsprintf_s(str, szFormat, argptr);
     va_end(argptr);
 
-    printf(str);
+    //printf(str);
     OutputDebugString(str);
 }
 #endif
@@ -43,6 +43,8 @@ struct AudioSample4
 	int left;
 	int right;
 };
+
+
 
 struct ThreeByteSample
 {
@@ -90,16 +92,33 @@ void FillBuffer(bool zoom)
 
 void FillData4(void* context, UCHAR *buffer, int& len)
 {
-	AudioSample4 *sampleBuff = (AudioSample4 *)buffer;
-	int sampleLength = len / sizeof(AudioSample4);
+	static int globalCount = 0;
+	UCHAR *sampleBuff = buffer;
+	int sampleLength = len / sizeof(int);
 
-	for(int i = 0; i < sampleLength; i++)
+	for(int i = 0; i < sampleLength; i += 8)
 	{
-		sampleBuff[i].left =  dummybuffer[globalReadBuffer].left;
-		sampleBuff[i].right = dummybuffer[globalReadBuffer].right;
+		for (int j = 0; j < 2; j++)
+		{
+			*((UINT *)(sampleBuff)) = dummybuffer[globalReadBuffer].left;
+			sampleBuff += 4;
+			//*(sampleBuff++) = (dummybuffer[globalReadBuffer].left&0xff;
+			//*(sampleBuff++) = (dummybuffer[globalReadBuffer].left >> 8)&0xff;
+			//*(sampleBuff++) = (dummybuffer[globalReadBuffer].left >> 16)&0xff;
+			//*(sampleBuff++) = (dummybuffer[globalReadBuffer].left >> 24)&0xff;
+		}
+		for (int j = 2; j < 8; j++)
+		{
+			*(sampleBuff++) = 1;
+			*(sampleBuff++) = 2;
+			*(sampleBuff++) = 3;
+			*(sampleBuff++) = 4;
+		}
 		globalReadBuffer++;
 		if(globalReadBuffer >= 48) 
 			globalReadBuffer = 0;
+
+		globalCount++;
 	}
 	globalPacketCounter++;
 	if(globalPacketCounter > 0xFF)

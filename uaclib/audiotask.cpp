@@ -42,7 +42,9 @@ bool AudioTask::BeforeStart()
 
 	m_SubmittedCount = 0;
 	m_CompletedCount = 0;
-	m_FrameNumber = 0;
+
+	// set first frame 100ms in the future
+	m_FrameNumber = m_device->GetCurrentFrameNumber() + 0;
 	m_LastStartFrame = 0;
 	m_isoTransferErrorCount = 0;
 
@@ -185,6 +187,11 @@ bool AudioTask::Work(volatile TaskState& taskState)
 		RWBuffer(nextXfer, dataLength);
 	}
 
+		// enable output after first requests have been issued
+	if (0 == m_CompletedCount)
+		AfterPrime();
+
+
 	//find next waiting buffer in queue
 	nextXfer = m_isoBuffers + m_completedIndex;
 	if (!nextXfer || taskState != TaskStarted) 
@@ -221,6 +228,7 @@ bool AudioTask::Work(volatile TaskState& taskState)
 		m_isoTransferErrorCount = 0; //reset error count
 	}
 
+
 	IsoXferComplete(nextXfer, transferred);
 #ifdef _ENABLE_TRACE
 	CalcStatistics(transferred);
@@ -250,9 +258,21 @@ bool AudioDACTask::BeforeStartInternal()
 		m_sampleNumbers = 0;
 		m_tickCount = 0;
 #endif
-	return m_device->UsbSetPipePolicy((UCHAR)m_pipeId, ISO_ALWAYS_START_ASAP, 1, &policyValue) &&
-		m_device->UsbSetPipePolicy((UCHAR)m_pipeId, RESET_PIPE_ON_RESUME, 1, &policyValue); //experimental
+	
+
+	//m_device->UsbSetPipePolicy((UCHAR)m_pipeId, RAW_IO, 1, &policyValue);
+	policyValue = 1;
+	m_device->UsbSetPipePolicy((UCHAR)m_pipeId, ISO_ALWAYS_START_ASAP, 1, &policyValue);
+	return TRUE; 
+		//m_device->UsbSetPipePolicy((UCHAR)m_pipeId, ISO_ALWAYS_START_ASAP, 1, &policyValue) &&
+		//m_device->UsbSetPipePolicy((UCHAR)m_pipeId, RESET_PIPE_ON_RESUME, 1, &policyValue); //experimental
 }
+
+void AudioDACTask::AfterPrime()
+{
+	m_device->EnableOutput();
+}
+
 
 bool AudioDACTask::AfterStopInternal()
 {
@@ -265,9 +285,11 @@ bool AudioDACTask::AfterStopInternal()
 
 int AudioDACTask::FillBuffer(ISOBuffer* nextXfer)
 {
-	float raw_cur_feedback = m_feedbackInfo == NULL || m_feedbackInfo->GetValue() == 0.0f 
-						?  m_defaultPacketSize
-						:  m_feedbackInfo->GetValue(); //value in stereo samples in one second // BSB: or in one milisecond??
+	float raw_cur_feedback = m_defaultPacketSize - 0.001;
+		
+//		m_feedbackInfo == NULL || m_feedbackInfo->GetValue() == 0.0f 
+//						?  m_defaultPacketSize
+//						:  m_feedbackInfo->GetValue(); //value in stereo samples in one second // BSB: or in one milisecond??
 
 	int maxSamplesInPacket = m_packetSize / m_channelNumber / m_sampleSize; //max stereo samples in one packet
 	if(raw_cur_feedback > (float)(maxSamplesInPacket))
@@ -293,6 +315,15 @@ int AudioDACTask::FillBuffer(ISOBuffer* nextXfer)
 			frac = 0.f;
 			addSample = 0;
 		}
+		
+		//frac += 0.1f;
+
+		if (AddOne > 0)
+		{
+			addSample += 1.0;
+			AddOne--;
+		}
+
 		icur_feedback *= m_channelNumber * m_sampleSize;
 		for (int packetIndex = 0; packetIndex < nextXfer->IsoContext->NumberOfPackets; packetIndex++)
 		{
@@ -309,7 +340,7 @@ int AudioDACTask::FillBuffer(ISOBuffer* nextXfer)
 				nextOffSet -= m_channelNumber * m_sampleSize; //append additional stereo sample
 				addSample += 1.f;
 			}
-			nextXfer->IsoContext->IsoPackets[packetIndex].Length = nextOffSet - nextXfer->IsoContext->IsoPackets[packetIndex].Offset;
+//			nextXfer->IsoContext->IsoPackets[packetIndex].Length = nextOffSet - nextXfer->IsoContext->IsoPackets[packetIndex].Offset;
 		}
 		dataLength = (int)nextOffSet;
 
@@ -332,9 +363,11 @@ int AudioDACTask::FillBuffer(ISOBuffer* nextXfer)
 	else
 	{
 		//default transfer length
-		dataLength = (int)(m_defaultPacketSize * m_packetPerTransfer);
+		dataLength = (int)(m_defaultPacketSize * m_packetPerTransfer)*(m_channelNumber * m_sampleSize);
 		memset(nextXfer->DataBuffer, 0, dataLength);
 	}
+	
+	//dataLength = 512*m_packetPerTransfer; //(int)(m_defaultPacketSize * m_packetPerTransfer)*(m_channelNumber * m_sampleSize);
 	return dataLength;
 }
 
@@ -394,10 +427,18 @@ bool AudioADCTask::BeforeStartInternal()
 	return m_device->UsbSetPipePolicy((UCHAR)m_pipeId, ISO_ALWAYS_START_ASAP, 1, &policyValue);
 }
 
+void AudioADCTask::AfterPrime()
+{
+	m_device->EnableRx();
+}
+
+
 bool AudioADCTask::AfterStopInternal()
 {
 	return TRUE;
 }
+
+
 
 int AudioADCTask::FillBuffer(ISOBuffer* nextXfer)
 {
@@ -425,18 +466,56 @@ void AudioADCTask::ProcessBuffer(ISOBuffer* buffer)
 	for(int i = 0; i < buffer->IsoContext->NumberOfPackets; i++)
 	{
 		packetLength = buffer->IsoContext->IsoPackets[i].Length;
-#ifdef PACK_ADC_BUFFER
-		memcpy(buffer->DataBuffer + recLength, buffer->DataBuffer + buffer->IsoPackets[i].Offset, packetLength);
+		UCHAR *Src = (buffer->DataBuffer + buffer->IsoPackets[i].Offset);
+		UCHAR *Dest = ((UCHAR*) &BCABuff) + BCABuffHead;
+		
+		int Len = packetLength;
+		
+		if (BCABuffHead + packetLength > sizeof(BCABuff))
+		{
+			Len = sizeof(BCABuff) - BCABuffHead;
+			memcpy( Dest, Src, Len );
+			Src +=  Len;
+			BCABuffHead = (BCABuffHead+Len) % (sizeof(BCABuff));
+			Dest = ((UCHAR*) &BCABuff) + BCABuffHead;
+			BCABuffCount += Len;
+			Len = packetLength - Len;
+		}
+
+		memcpy( Dest, Src, Len );
+		BCABuffHead = (BCABuffHead+Len) % (sizeof(BCABuff));
+		BCABuffCount += Len;
+
 		recLength += packetLength;
-#else
-		recLength += packetLength;
-		if(m_writeDataCb && packetLength > 0)
-			m_writeDataCb(m_writeDataCbContext, buffer->DataBuffer + buffer->IsoPackets[i].Offset, packetLength);
-#endif
 	}
+
 #ifdef PACK_ADC_BUFFER
 	if(m_writeDataCb)
-		m_writeDataCb(m_writeDataCbContext, buffer->DataBuffer, recLength);
+	{
+		if (BCABuffCount > 4000)
+		{
+			if (BCABuffTail > BCABuffHead)
+			{
+				UCHAR *Src = ((UCHAR*) &BCABuff) + BCABuffTail;
+				int Count = ((sizeof(BCABuff)) - BCABuffTail)/(8*4);
+				Count *= (8*4);
+				m_writeDataCb(m_writeDataCbContext, Src, Count);
+				BCABuffTail = (BCABuffTail+Count) % (sizeof(BCABuff));
+				BCABuffCount -= Count;
+			}
+
+			if (BCABuffCount)
+			{
+				UCHAR *Src = ((UCHAR*) &BCABuff) + BCABuffTail;
+				int Count = BCABuffCount/(8*4);
+				Count *= (8*4);
+				m_writeDataCb(m_writeDataCbContext, (UCHAR *)Src, Count);
+				BCABuffTail = (BCABuffTail+(Count)) % (sizeof(BCABuff));
+				BCABuffCount -= Count;
+			}
+			
+		}
+	}
 #endif
 	if(m_feedbackInfo)
 	{
@@ -463,12 +542,12 @@ void AudioADCTask::CalcStatistics(int sampleNumbers)
 
 int AudioFeedbackTask::FillBuffer(ISOBuffer* nextXfer)
 {
-	return m_packetPerTransfer * m_packetSize;
+	return 64;
 }
 
 bool AudioFeedbackTask::RWBuffer(ISOBuffer* nextXfer, int len)
 {
-	if(!m_device->UsbIsoReadPipe(m_pipeId, nextXfer->DataBuffer, len, (LPOVERLAPPED)nextXfer->OvlHandle, nextXfer->IsoContext))
+	if(!m_device->UsbReadPipe(m_pipeId, nextXfer->DataBuffer, len, (LPOVERLAPPED)nextXfer->OvlHandle))
 	{
 #ifdef _ENABLE_TRACE
 		debugPrintf("ASIOUAC: %s. IsoReadPipe (feedback) failed. ErrorCode: %08Xh\n", TaskName(), m_device->GetErrorCode());
@@ -482,22 +561,51 @@ void AudioFeedbackTask::ProcessBuffer(ISOBuffer* nextXfer)
 {
 	if(m_feedbackInfo == NULL)
 		return;
-	KISO_PACKET isoPacket = nextXfer->IsoPackets[nextXfer->IsoContext->NumberOfPackets - 1];
-	//TODO: isoPacket.Length may be 3 or 4
-	if (isoPacket.Length > 1)
+
+
+	unsigned short *Count = (unsigned short *) &nextXfer->DataBuffer[18];
+
+	for (int i = 0; i < 64; i++)
 	{
-		int feedback = *((int*)(nextXfer->DataBuffer + isoPacket.Offset));
-		m_feedbackInfo->SetValue(feedback);
+		if (nextXfer->DataBuffer[i] != MyFeedback[i])
+		{
+#ifdef _ENABLE_TRACE
+			if ((i != 18) && (i != 19))
+				debugPrintf("Feedback: %d: %02.2X->%02.2X. \n", i, MyFeedback[i], nextXfer->DataBuffer[i]);
+#endif
+		}
 	}
+
+	memcpy( MyFeedback, nextXfer->DataBuffer, 64 );
+
+	if (MyFeedback[16] == 0xff)
+	{
+		if (m_dac)
+		{
+			m_dac->IncrementAddOne();
+		}
+	}
+
+#ifdef _ENABLE_TRACE
+//	debugPrintf("ASIOUAC: %s. \n", TaskName());
+#endif
+
 }
 
 
 bool AudioFeedbackTask::BeforeStartInternal()
 {
+	memset( MyFeedback, 0, sizeof(MyFeedback));
 	//if(m_feedbackInfo != NULL)
 	//	m_feedbackInfo->SetValue(0);
 	return TRUE;
 }
+
+void AudioFeedbackTask::AfterPrime()
+{
+}
+
+
 
 bool AudioFeedbackTask::AfterStopInternal()
 {

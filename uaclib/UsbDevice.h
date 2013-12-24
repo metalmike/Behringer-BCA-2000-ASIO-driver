@@ -50,6 +50,7 @@ class USBDevice
 	//
 	USB_CONFIGURATION_DESCRIPTOR	m_configDescriptor;
 	//
+public:
 	KUSB_HANDLE						m_usbDeviceHandle;
 
 	KLST_DEVINFO_HANDLE				m_deviceInfo;
@@ -63,6 +64,7 @@ class USBDevice
 	KUSB_HANDLE FindDevice();
 	bool ParseDescriptors(BYTE *configDescr, DWORD length);
 	void InitDescriptors();
+
 
 	bool							m_deviceIsConnected;
 protected:
@@ -98,6 +100,17 @@ public:
 	USBDevice();
 	virtual ~USBDevice();
 	virtual bool InitDevice();
+	bool InitMutex();
+
+	bool IsBoot;
+
+	UINT GetCurrentFrameNumber()
+	{
+		UINT FrameNo = 0;
+		bool res = UsbK_GetCurrentFrameNumber	(	m_usbDeviceHandle,
+			&FrameNo );
+		return FrameNo;
+	}
 
 	virtual bool IsValidDevice() { return m_usbDeviceHandle != NULL; }
 
@@ -202,6 +215,35 @@ public:
 #endif
 		return FALSE;
 	}
+
+	bool UsbReadPipe (UCHAR PipeID, PUCHAR Buffer, ULONG BufferLength, LPOVERLAPPED Overlapped)
+	{
+		DWORD lastError;
+		UINT Transferred = 0;
+		if(UsbK_ReadPipe (m_usbDeviceHandle, PipeID, Buffer, BufferLength, &Transferred, Overlapped) || 
+			ERROR_IO_PENDING == (lastError = GetLastErrorInternal()))
+			return TRUE;
+		m_errorCode = lastError;
+#ifdef _ENABLE_TRACE
+		debugPrintf("ASIOUAC: UsbK_ReadPipe failed. ErrorCode: %08Xh\n", m_errorCode);
+#endif
+		return FALSE;
+	}
+
+	bool UsbWritePipe (UCHAR PipeID, PUCHAR Buffer, ULONG BufferLength, LPOVERLAPPED Overlapped)
+	{
+		DWORD lastError;
+		UINT Transferred = 0;
+		if(UsbK_WritePipe (m_usbDeviceHandle, PipeID, Buffer, BufferLength, &Transferred, Overlapped) || 
+			ERROR_IO_PENDING == (lastError = GetLastErrorInternal()))
+			return TRUE;
+		m_errorCode = lastError;
+#ifdef _ENABLE_TRACE
+		debugPrintf("ASIOUAC: UsbK_WritePipe failed. ErrorCode: %08Xh\n", m_errorCode);
+#endif
+		return FALSE;
+	}
+
 
 	bool UsbIsoWritePipe(UCHAR PipeID, PUCHAR Buffer, ULONG BufferLength, LPOVERLAPPED Overlapped, PKISO_CONTEXT IsoContext)
 	{

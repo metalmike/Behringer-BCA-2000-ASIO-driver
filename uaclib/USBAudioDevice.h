@@ -54,6 +54,20 @@ typedef void (*NotifyCallback)(void* context, int reason);
 
 typedef TList<USBAudioControlInterface> USBACInterfaceList;
 typedef TList<USBAudioStreamingInterface> USBASInterfaceList;
+typedef TList<USBFirmwareInterface> USBFWInterfaceList;
+
+
+#pragma pack (push, 1)
+typedef struct tag_Cmd2_Packet
+{
+	unsigned char Byte0;
+	unsigned char Byte1;
+	unsigned char Byte2;
+	unsigned char Byte3;
+} CMD2_PACKET;
+#pragma pack (pop)
+
+
 
 class USBAudioDevice : public USBDevice
 {
@@ -62,6 +76,7 @@ class USBAudioDevice : public USBDevice
 
 	USBACInterfaceList				m_acInterfaceList;
 	USBASInterfaceList				m_asInterfaceList;
+	USBFWInterfaceList				m_fwInterfaceList;
 
 	void FreeDeviceInternal();
 	void InitDescriptors();
@@ -69,18 +84,31 @@ class USBAudioDevice : public USBDevice
 	int								m_audioClass;
 	bool							m_useInput;
 
-	USBAudioStreamingEndpoint*		m_dacEndpoint;
-	USBAudioStreamingEndpoint*		m_adcEndpoint;
-	USBAudioStreamingEndpoint*		m_fbEndpoint;
+	char FolderLocation[_MAX_PATH];
+
+	USBFirmwareEndpoint*		m_dacEndpoint;
+	USBFirmwareEndpoint*		m_adcEndpoint;
+	USBFirmwareEndpoint*		m_fbEndpoint;
+
+	//USBAudioStreamingEndpoint*		m_dacEndpoint;
+	//USBAudioStreamingEndpoint*		m_adcEndpoint;
+	//USBAudioStreamingEndpoint*		m_fbEndpoint;
 
 	NotifyCallback					m_notifyCallback;
 	void*							m_notifyCallbackContext;
+
+	CMD2_PACKET						m_cmd2Pckt;
 protected:
 	virtual void FreeDevice();
+
 
 	virtual bool ParseDescriptorInternal(USB_DESCRIPTOR_HEADER* uDescriptor);
 
 	bool SetSampleRateInternal(int freq);
+
+	USBFirmwareEndpoint* FindFWDest();
+	USBFirmwareEndpoint* FindFWEndpoint( int Addr );
+	bool SuppressDebug;
 
 	USBAudioClockSource* FindClockSource(int freq);
 	bool CheckSampleRate(USBAudioClockSource* clocksrc, int freq);
@@ -90,6 +118,12 @@ protected:
 	USBAudioFeatureUnit*		FindFeatureUnit(int id);
 	USBAudioOutTerminal*		FindOutTerminal(int id);
 
+	bool LoadBootCode( );
+	bool LoadFPGACode( );
+	bool PostBCACmd( unsigned char Cmd, unsigned char Len = 0, unsigned char *data = NULL, int datalen = 0);
+	bool PostBCAControl02( unsigned char B0, unsigned char B1, unsigned char B2, unsigned char B3, unsigned char B4 = 0  );
+	bool PostBCAControl12( unsigned char B0, unsigned char B1, unsigned char B2, unsigned char B3, unsigned char B4, unsigned char B5, unsigned char B6  );
+
 public:
 	USBAudioDevice(bool useInput);
 	virtual ~USBAudioDevice();
@@ -98,6 +132,8 @@ public:
 	bool CanSampleRate(int freq);
 	bool SetSampleRate(int freq);
 	int GetCurrentSampleRate();
+	void EnableOutput();
+	void EnableRx();
 
 	int GetInputChannelNumber();
 	int GetOutputChannelNumber();
@@ -115,19 +151,19 @@ public:
 
 	int GetDACSubslotSize()
 	{
-		return m_dacEndpoint ? m_dacEndpoint->m_interface->m_formatDescriptor.bSubslotSize : 0;
+		return 4;
 	}
 	int GetADCSubslotSize()
 	{
-		return m_adcEndpoint ? m_adcEndpoint->m_interface->m_formatDescriptor.bSubslotSize : 0;
+		return 4;
 	}
 	int GetDACBitResolution()
 	{
-		return m_dacEndpoint ? m_dacEndpoint->m_interface->m_formatDescriptor.bBitResolution : 0;
+		return 32;
 	}
 	int GetADCBitResolution()
 	{
-		return m_adcEndpoint ? m_adcEndpoint->m_interface->m_formatDescriptor.bBitResolution : 0;
+		return 24;
 	}
 	int GetAudioClass()
 	{

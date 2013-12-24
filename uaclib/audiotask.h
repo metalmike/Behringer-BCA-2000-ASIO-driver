@@ -24,9 +24,17 @@
 extern void debugPrintf(const _TCHAR *szFormat, ...);
 #endif
 
-#define packetPerTransferDAC	16
-#define packetPerTransferADC	16
+#define packetPerTransferDAC	80
+#define packetPerTransferADC	80
 #define packetPerTransferFb		8
+
+
+typedef struct BCABuff_tag
+{
+	UINT ChannelData[8];
+} BCABUFF;
+
+
 
 class USBAudioDevice;
 
@@ -100,7 +108,7 @@ public:
 		if(newValue != 0.f && fabs(last_value - newValue)/newValue > 0.5f / interval)
 			//(int)(10*last_value) != (int)(10*newValue))
 //			debugPrintf("ASIOUAC: Set fb value: %f (raw = %d, curVal = %f)\n", interval * newValue, feedbackValue, interval * cur_value);
-			debugPrintf("ASIOUAC: Set fb value: %f (raw=%d, cur_value=%f, playback_value=%f)\n", interval * newValue, feedbackValue, interval * cur_value, interval * playback_value);
+//			debugPrintf("ASIOUAC: Set fb value: %f (raw=%d, cur_value=%f, playback_value=%f)\n", interval * newValue, feedbackValue, interval * cur_value, interval * playback_value);
 
 		last_value = newValue;
 #endif
@@ -351,7 +359,7 @@ struct ISOBuffer
 	KISO_PACKET*    IsoPackets;
 };
 
-#define MAX_OUTSTANDING_TRANSFERS	6
+#define MAX_OUTSTANDING_TRANSFERS	4
 
 
 class AudioTask : public TaskThread
@@ -372,7 +380,8 @@ class AudioTask : public TaskThread
 	void SetNextFrameNumber(ISOBuffer* buffer)
 	{
 		buffer->IsoContext->StartFrame = m_FrameNumber;
-		m_FrameNumber += m_channelNumber * m_sampleSize;
+		// there are 8 microframes and interval is one
+		m_FrameNumber += packetPerTransferDAC / 8; //m_channelNumber * m_sampleSize;
 	}
 
 	void IsoXferComplete(ISOBuffer* buffer, ULONG transferLength)
@@ -414,6 +423,9 @@ protected:
 	virtual int FillBuffer(ISOBuffer* buffer) = 0;
 	virtual bool RWBuffer(ISOBuffer* buffer, int len) = 0;
 	virtual void ProcessBuffer(ISOBuffer* buffer) = 0;
+
+	virtual void AfterPrime() = 0;
+
 
 #ifdef _ENABLE_TRACE
 	virtual void CalcStatistics(int sampleNumbers) {}
@@ -457,6 +469,7 @@ public:
 
 	bool BeforeStart();
 	bool AfterStop();
+
 	bool Work(volatile TaskState& taskState);
 	_TCHAR* TaskName() 
 	{
@@ -516,6 +529,7 @@ protected:
 	virtual int FillBuffer(ISOBuffer* buffer);
 	virtual bool RWBuffer(ISOBuffer* buffer, int len);
 	virtual void ProcessBuffer(ISOBuffer* buffer);
+	virtual void AfterPrime();
 
 #ifdef _ENABLE_TRACE
 	virtual void CalcStatistics(int sampleNumbers);
@@ -525,10 +539,14 @@ public:
 	AudioDACTask() : AudioTask(packetPerTransferDAC, "Audio DAC task"), m_feedbackInfo(NULL), m_readDataCb(NULL), m_readDataCbContext(NULL)
 	{
 #ifdef _ENABLE_TRACE
-		m_dumpFile = fopen("c:\\dac_dump.bin", "wb");
+		m_dumpFile = NULL;
+		//m_dumpFile = fopen("c:\\dac_dump.bin", "wb");
 		debugPrintf("Created file c:\\dac_dump.bin");
 #endif
+		AddOne = 0;
 	}
+
+	int AddOne;
 
 	~AudioDACTask()
 	{
@@ -561,8 +579,11 @@ protected:
 		if(m_isStarted)
 			return FALSE;
 
+		// packet size always must be the maxpacketsize
+		m_packetSize = m_maximumPacketSize;
+
 		m_defaultPacketSize = (float)freq / 8000.f * (1 << (m_interval - 1)); // size in stereo samples in microframe
-		m_packetSize = m_channelNumber * m_sampleSize * ((int)m_defaultPacketSize + 1); //size in bytes = (packetSize + 1 extra frame) * size of frame
+		//m_packetSize = m_channelNumber * m_sampleSize * ((int)m_defaultPacketSize + 1); //size in bytes = (packetSize + 1 extra frame) * size of frame
 
 		if(BufferIsAllocated())
 			FreeBuffers();
@@ -575,14 +596,27 @@ protected:
 	virtual int FillBuffer(ISOBuffer* buffer);
 	virtual bool RWBuffer(ISOBuffer* buffer, int len);
 	virtual void ProcessBuffer(ISOBuffer* buffer);
+	virtual void AfterPrime();
 
 #ifdef _ENABLE_TRACE
 	virtual void CalcStatistics(int sampleNumbers);
 #endif
 
+	// one second of buffer
+	BCABUFF BCABuff[96000];
+	int BCABuffHead;  // in individual 1 bytes 
+	int BCABuffTail;  // in individual 1 bytes samples
+	int BCABuffCount;  // in individual 1 bytes samples
+
+
+
 public:
 	AudioADCTask() : AudioTask(packetPerTransferADC, "Audio ADC task"), m_feedbackInfo(NULL), m_writeDataCb(NULL), m_writeDataCbContext(NULL)
-	{}
+	{
+		BCABuffHead = 0;  // in individual 4 bytes samples
+		BCABuffTail = 0;  // in individual 4 bytes samples
+		BCABuffCount = 0;  // in individual 4 bytes samples
+	}
 
 	~AudioADCTask()
 	{}
@@ -599,9 +633,42 @@ public:
 	}
 };
 
+
+class AudioDAC : public BaseThread<AudioDACTask>
+{
+public:
+	AudioDAC()
+	{
+	}
+	void Init(USBAudioDevice* device, FeedbackInfo* fb, UCHAR pipeId, USHORT maximumPacketSize, UCHAR interval, UCHAR channelNumber, UCHAR sampleSize)
+	{
+		m_Task.Init(device, pipeId, maximumPacketSize, interval, channelNumber, sampleSize);
+		m_Task.SetFeedbackInfo(fb);
+	}
+
+	void IncrementAddOne()
+	{
+		m_Task.AddOne++;
+	}
+
+	void SetSampleFreq(int freq)
+	{
+		m_Task.SetSampleFreq(freq);
+	}
+	void SetCallback(FillDataCallback readDataCb, void* context)
+	{
+		m_Task.SetCallback(readDataCb, context);
+	}
+};
+
+
 class AudioFeedbackTask : public AudioTask
 {
 	FeedbackInfo*	m_feedbackInfo;
+
+	UCHAR MyFeedback[64];
+
+
 protected:
 	bool InitBuffers(int freq)
 	{
@@ -622,12 +689,18 @@ protected:
 	virtual int FillBuffer(ISOBuffer* buffer);
 	virtual bool RWBuffer(ISOBuffer* buffer, int len);
 	virtual void ProcessBuffer(ISOBuffer* buffer);
+	virtual void AfterPrime();
 public:
 	AudioFeedbackTask() : AudioTask(packetPerTransferFb, "Audio feedback task"), m_feedbackInfo(NULL)
-	{}
+	{
+		m_dac = NULL;
+	}
 
 	~AudioFeedbackTask()
 	{}
+
+	AudioDAC *m_dac;
+
 
 	void SetFeedbackInfo(FeedbackInfo* fb)
 	{
@@ -635,29 +708,10 @@ public:
 	}
 };
 
-class AudioDAC : public BaseThread<AudioDACTask>
-{
-public:
-	AudioDAC()
-	{
-	}
-	void Init(USBAudioDevice* device, FeedbackInfo* fb, UCHAR pipeId, USHORT maximumPacketSize, UCHAR interval, UCHAR channelNumber, UCHAR sampleSize)
-	{
-		m_Task.Init(device, pipeId, maximumPacketSize, interval, channelNumber, sampleSize);
-		m_Task.SetFeedbackInfo(fb);
-	}
-	void SetSampleFreq(int freq)
-	{
-		m_Task.SetSampleFreq(freq);
-	}
-	void SetCallback(FillDataCallback readDataCb, void* context)
-	{
-		m_Task.SetCallback(readDataCb, context);
-	}
-};
 
 class AudioADC : public BaseThread<AudioADCTask>
 {
+
 public:
 	AudioADC()
 	{
@@ -683,12 +737,16 @@ public:
 	AudioFeedback()
 	{
 	}
-	void Init(USBAudioDevice* device, FeedbackInfo* fb, UCHAR pipeId, USHORT maximumPacketSize, UCHAR interval, UCHAR valueSize)
+	
+
+	void Init(USBAudioDevice* device, FeedbackInfo* fb, UCHAR pipeId, USHORT maximumPacketSize, UCHAR interval, UCHAR valueSize, AudioDAC *dac )
 	{
 		m_Task.Init(device, pipeId, maximumPacketSize, interval, 1, valueSize);
 		//WARNING! ADC & DAC endpoints must have the same values of the intervals for implicit feedback
 		m_Task.SetFeedbackInfo(fb);
 		m_Task.SetSampleFreq(48000); //set any sample rate only for allocate buffers
+
+		m_Task.m_dac = dac;
 	}
 };
 
