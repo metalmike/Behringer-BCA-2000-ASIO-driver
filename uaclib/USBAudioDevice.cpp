@@ -43,12 +43,38 @@
 
 #include "USBAudioDevice.h"
 
+bool USBAudioDevice::FirmwareLoaded = false;
 
 USBAudioDevice::USBAudioDevice(bool useInput) : m_fbInfo(), m_dac(NULL), m_adc(NULL), m_feedback(NULL), m_useInput(useInput),
 	m_lastParsedInterface(NULL), m_lastParsedEndpoint(NULL), m_audioClass(0),
 	m_dacEndpoint(NULL), m_adcEndpoint(NULL), m_fbEndpoint(NULL), m_notifyCallback(NULL), m_notifyCallbackContext(NULL), m_isStarted(FALSE)
 {
 	InitDescriptors();
+
+	m_cmd2Pckt.Byte0 = 0x00;
+	m_cmd2Pckt.Byte1 = 0x20;
+	m_cmd2Pckt.Byte2 = 0x00;
+	m_cmd2Pckt.Byte3 = 0x00;
+
+
+	HMODULE h = GetModuleHandle( "asiouac2.dll" );
+
+	if (NULL == h)
+		h = GetModuleHandle( "WidgetTest.exe" );
+
+
+	GetModuleFileName( h, FolderLocation, sizeof(FolderLocation) );
+
+	for (int i = strlen( FolderLocation )-1; i > 0; i--)
+	{
+		if (FolderLocation[i] == '\\')
+		{
+			FolderLocation[i] = 0;
+			break;
+		}
+	}
+
+	strcat( FolderLocation, "\\" );
 }
 
 USBAudioDevice::~USBAudioDevice()
@@ -128,6 +154,34 @@ bool USBAudioDevice::ParseDescriptorInternal(USB_DESCRIPTOR_HEADER* uDescriptor)
 						m_asInterfaceList.Add(iASface);
 					}					
 					return TRUE;
+
+				case USB_DEVICE_CLASS_VENDOR_SPECIFIC:
+					{
+#ifdef _ENABLE_TRACE
+						debugPrintf("ASIOUAC: Found audio streaming interface 0x%X (alt num 0x%X) with %d endpoints\n", interfaceDescriptor->bInterfaceNumber, 
+							interfaceDescriptor->bAlternateSetting, interfaceDescriptor->bNumEndpoints);
+#endif
+						USBFirmwareInterface *iACface = new USBFirmwareInterface(interfaceDescriptor);
+						m_lastParsedInterface = iACface;
+						m_fwInterfaceList.Add(iACface);
+					}
+					return TRUE;
+
+
+				// BCA interface descriptor is type 0
+				case 00:
+					{
+#ifdef _ENABLE_TRACE
+						debugPrintf("ASIOUAC: Found BCA with firmware interface 0x%X (alt num 0x%X) with %d endpoints\n", interfaceDescriptor->bInterfaceNumber, 
+							interfaceDescriptor->bAlternateSetting, interfaceDescriptor->bNumEndpoints);
+#endif
+						USBFirmwareInterface *iACface = new USBFirmwareInterface(interfaceDescriptor);
+						m_lastParsedInterface = iACface;
+						m_fwInterfaceList.Add(iACface);
+					}
+					return TRUE;
+
+
 				default:
 					m_lastParsedInterface = NULL;
 					return FALSE;
@@ -164,14 +218,94 @@ bool USBAudioDevice::ParseDescriptorInternal(USB_DESCRIPTOR_HEADER* uDescriptor)
 
 bool USBAudioDevice::InitDevice()
 {
+	SuppressDebug = false;
+
+	InitMutex();
+
 	if(!USBDevice::InitDevice())
 		return FALSE;
+
+	// if detected the boot device, then load firmware
+	// and re-initialise.
+	if (IsBoot)
+	{
+		LoadBootCode( );
+		Sleep(5000);
+		if(!USBDevice::InitDevice())
+			return FALSE;
+	}
+
+	if (IsBoot)
+	{
+		return FALSE;
+	}
+
+	if (!LoadFPGACode( ))
+	{
+#ifdef _ENABLE_TRACE
+		debugPrintf("ASIOUAC: Failed to load FPGA code\n" );
+#endif
+		return FALSE;
+	}
+
+
+
 	if(m_useInput)
 	{
+		USBFirmwareEndpoint *epoint = FindFWEndpoint( 0x86 ) ;
+
+		if (epoint)
+		{
+			m_adc = new AudioADC();
+			m_adc->Init(this, &m_fbInfo, epoint->m_descriptor.bEndpointAddress, 
+				epoint->m_descriptor.wMaxPacketSize, 
+				epoint->m_descriptor.bInterval, 
+				8, 
+				4);
+			m_adc->SetSampleFreq( 48000 );
+			m_adcEndpoint = epoint;
+		}
+
+	}
+
+	{
+		USBFirmwareEndpoint *epoint = FindFWEndpoint( 0x02 ) ;
+		if (epoint)
+		{
+			m_dac = new AudioDAC();
+			m_dac->Init(this, &m_fbInfo, epoint->m_descriptor.bEndpointAddress, epoint->m_descriptor.wMaxPacketSize, 
+				epoint->m_descriptor.bInterval, 
+				8, 
+				4);
+			m_dac->SetSampleFreq( 48000 );
+			m_dacEndpoint = epoint;
+		}
+	}
+
+
+	// create feedback reader
+	{
+		USBFirmwareEndpoint *epoint = FindFWEndpoint( 0x81 ) ;
+		if (epoint)
+		{
+			m_feedback = new AudioFeedback();
+			m_feedback->Init(this, &m_fbInfo, epoint->m_descriptor.bEndpointAddress, epoint->m_descriptor.wMaxPacketSize, 
+				epoint->m_descriptor.bInterval, 
+				64,
+				m_dac);
+			m_fbEndpoint = epoint;
+		}
+	}
+
+
+#ifdef NOTHERENOW
+
 		USBAudioStreamingInterface * iface = m_asInterfaceList.First();
 		while(iface)
 		{
 			USBAudioStreamingEndpoint * epoint = iface->m_endpointsList.First();
+
+
 			while(epoint)
 			{
 				if(USB_ENDPOINT_DIRECTION_IN(epoint->m_descriptor.bEndpointAddress) && 
@@ -276,72 +410,354 @@ bool USBAudioDevice::InitDevice()
 			break;
 		iface = m_asInterfaceList.Next(iface);
 	}
+
+#endif
+
 	return TRUE;
+}
+
+
+bool USBAudioDevice::LoadBootCode( )
+{
+
+	char FileLocation[_MAX_PATH];
+	strcpy(FileLocation, FolderLocation);
+
+	USBFirmwareEndpoint* FWEndpoint = FindFWDest();
+
+	unsigned char  buf[512];
+
+	ZeroMemory(buf,512);
+
+	LONG bytesToSend = 1;
+	bool retValue;
+	UINT lengthTransferred = 0;
+
+#ifdef _ENABLE_TRACE
+	debugPrintf("ASIOUAC: Found BCA-2000 in boot mode\n" );
+#endif
+
+	// halt CPU
+	buf[0] = 1;
+	retValue = SendUsbControl(BMREQUEST_DIR_HOST_TO_DEVICE, BMREQUEST_TYPE_VENDOR, BMREQUEST_RECIPIENT_DEVICE, 
+			0xA0, 
+			0xe600, 
+			0,
+			(unsigned char*)buf, 1, &lengthTransferred);
+
+#ifdef _ENABLE_TRACE
+	debugPrintf("ASIOUAC: Sending firmware \"BCA2000-2106-firmwarebin.bin\"\n" );
+#endif
+
+	strcat( FileLocation, "BCA2000-2106-firmwarebin.bin" );
+
+	FILE *f = fopen( FileLocation, "rb" );
+	if (f)
+	{
+		bytesToSend = 512;
+		for (int i = 0; i < 8192/bytesToSend; i++)
+		{
+
+			unsigned short Value = i * bytesToSend;
+			int bytesRead = fread( buf, 1, bytesToSend, f );
+
+			retValue = SendUsbControl(BMREQUEST_DIR_HOST_TO_DEVICE, BMREQUEST_TYPE_VENDOR, BMREQUEST_RECIPIENT_DEVICE, 
+				0xA0, 
+				Value, 
+				0,
+				(unsigned char*)buf, bytesToSend, &lengthTransferred);
+		}
+		fclose(f);
+	}
+
+	// start CPU
+	buf[0] = 0;
+	retValue = SendUsbControl(BMREQUEST_DIR_HOST_TO_DEVICE, BMREQUEST_TYPE_VENDOR, BMREQUEST_RECIPIENT_DEVICE, 
+			0xA0, 
+			0xe600, 
+			0,
+			(unsigned char*)buf, 1, &lengthTransferred);
+
+	FreeDevice();
+
+#ifdef _ENABLE_TRACE
+	debugPrintf("ASIOUAC: Will now re-enumerate\n" );
+#endif
+
+
+	return false;
+}
+
+
+
+bool USBAudioDevice::PostBCACmd( unsigned char Cmd, unsigned char Len, unsigned char *data, int datalen )
+{
+	USBFirmwareEndpoint* FWEndpoint = FindFWEndpoint( 0x01 );
+
+
+	unsigned char  buf[512];
+
+	ZeroMemory(buf,512);
+
+	buf[0] = Cmd;
+	buf[1] = Len;
+	if (data)
+	{
+		if (datalen)
+			memcpy( buf+2, data, datalen );
+		else
+			memcpy( buf+2, data, Len );
+	}
+
+	long len = 52;
+
+	switch (Cmd)
+	{
+	case 7:
+		len = 52;
+		break;
+	case 2:
+		len = 64;
+		break;
+	}
+
+
+#ifdef _ENABLE_TRACE
+	if (!SuppressDebug)
+	{
+		char t[300];
+		char *p = t;
+		sprintf(p, "Sending Cmd 0x%02.2X len 0x%02.2X: ", Cmd, Len );
+		p += strlen(p);
+		for (int i = 0; i < 52; i++)
+		{
+			sprintf(p, "%02.2X ", buf[i] );
+			p += strlen(p);
+		}
+
+		debugPrintf("ASIOUAC: %s\n", t );
+	}
+#endif
+
+
+	UINT lengthTransferred = 0;
+	BOOL res = UsbK_WritePipe	( 
+		m_usbDeviceHandle,
+		FWEndpoint->m_descriptor.bEndpointAddress,
+		(unsigned char*)buf, 
+		len, 
+		&lengthTransferred,
+		NULL );	
+
+	return false;
+}
+
+bool USBAudioDevice::PostBCAControl02( unsigned char B0, unsigned char B1, unsigned char B2, unsigned char B3, unsigned char B4  )
+{
+	unsigned char t[5];
+	t[0] = B0;
+	t[1] = B1;
+	t[2] = B2;
+	t[3] = B3;
+
+	// extra byte seems to be looked at by firmware
+	t[4] = B4;
+
+	return PostBCACmd( 02, 4, t, sizeof(t) );
+}
+
+
+bool USBAudioDevice::PostBCAControl12( unsigned char B0, unsigned char B1, unsigned char B2, unsigned char B3, unsigned char B4, unsigned char B5, unsigned char B6  )
+{
+	unsigned char t[7];
+	t[0] = B0;
+	t[1] = B1;
+	t[2] = B2;
+	t[3] = B3;
+	t[4] = B4;
+	t[5] = B5;
+	t[6] = B6;
+
+	return PostBCACmd( 12, sizeof(t), t );
+}
+
+
+
+bool USBAudioDevice::LoadFPGACode( )
+{
+	char FileLocation[_MAX_PATH];
+	strcpy(FileLocation, FolderLocation);
+
+
+	if (!FirmwareLoaded)
+	{
+		unsigned char  buf[512];
+
+		ZeroMemory(buf,512);
+
+		LONG bytesToSend = 1;
+	#ifdef _ENABLE_TRACE
+		debugPrintf("ASIOUAC: Found BCA-2000 with firmware\n" );
+		debugPrintf("ASIOUAC: Loading FPGA code \"BCA2000-2106-fpga.bin\"\n" );
+	#endif
+
+		strcat( FileLocation, "BCA2000-2106-fpga.bin" );
+
+		FILE *f = fopen( FileLocation, "rb" );
+
+		if (f)
+		{
+			SuppressDebug = true;
+			int Total = 0;
+			bytesToSend = 32;
+			while (bytesToSend == 32)
+			{
+				bytesToSend = fread( buf, 1, bytesToSend, f );
+				if (bytesToSend < 32)
+				{
+					PostBCACmd( 0x10, bytesToSend, buf );
+				}
+				else
+				{
+					PostBCACmd( 0x10, bytesToSend, buf );
+				}
+
+				Total += bytesToSend;
+	#ifdef _ENABLE_TRACE
+				if (!(Total % 2560))
+					debugPrintf("  ASIOUAC: %06.6d bytes\r", Total );
+	#endif
+			}
+			fclose(f);
+
+			// tell it it's finished
+			PostBCACmd( 0x11, 0, buf );
+
+			SuppressDebug = false;
+
+	#ifdef _ENABLE_TRACE
+			debugPrintf("\nASIOUAC: FPGA Load complete\n", Total );
+	#endif
+			FirmwareLoaded = true;
+		}
+	}
+
+	m_cmd2Pckt.Byte0 = 0;
+	m_cmd2Pckt.Byte1 = 0x20;
+	m_cmd2Pckt.Byte2 = 0x00;
+	m_cmd2Pckt.Byte3 = 0x0;
+
+	PostBCAControl02( m_cmd2Pckt.Byte0, m_cmd2Pckt.Byte1, m_cmd2Pckt.Byte2, m_cmd2Pckt.Byte3 );
+
+	// set t0 pause data
+	m_cmd2Pckt.Byte0 = 0xc0;
+	m_cmd2Pckt.Byte1 = 0x38;
+	PostBCAControl02( m_cmd2Pckt.Byte0, m_cmd2Pckt.Byte1, m_cmd2Pckt.Byte2, m_cmd2Pckt.Byte3 );
+
+	//unsigned char tmp[20] = { 0, 0, 5, 0, 0, 0 };
+	//PostBCACmd( 0x07, 0, tmp, 6 );
+
+	if (FirmwareLoaded)
+		return true;
+
+	return false;
+}
+
+
+void USBAudioDevice::EnableOutput()
+{
+	m_cmd2Pckt.Byte0 |= 0x02; // 8 chan out? 
+	PostBCAControl02( m_cmd2Pckt.Byte0, m_cmd2Pckt.Byte1, m_cmd2Pckt.Byte2, m_cmd2Pckt.Byte3 );
+}
+
+void USBAudioDevice::EnableRx()
+{
+	m_cmd2Pckt.Byte1 &= 0xDF;// enable Rx
+
+	m_cmd2Pckt.Byte1 &= 0xF0;// don;t know exactly
+	m_cmd2Pckt.Byte1 |= 0x0A; 
+
+	PostBCAControl02( m_cmd2Pckt.Byte0, m_cmd2Pckt.Byte1, m_cmd2Pckt.Byte2, m_cmd2Pckt.Byte3 );
+
+	unsigned char tmp[20] = { 0, 0, 5, 0, 0, 0 };
+	PostBCACmd( 0x07, 0, tmp, 6 );
+
 }
 
 
 bool USBAudioDevice::CheckSampleRate(USBAudioClockSource* clocksrc, int newfreq)
 {
-	unsigned char buff[64];
-	UINT lengthTransferred = 0;
 	bool retVal = FALSE;
-	if(UsbClaimInterface(clocksrc->m_interface->Descriptor().bInterfaceNumber))
-	{
-		bool retValue = SendUsbControl(BMREQUEST_DIR_DEVICE_TO_HOST, BMREQUEST_TYPE_CLASS, BMREQUEST_RECIPIENT_INTERFACE, 
-			AUDIO_CS_REQUEST_RANGE, AUDIO_CS_CONTROL_SAM_FREQ << 8, (clocksrc->m_clockSource.bClockID << 8) + clocksrc->m_interface->Descriptor().bInterfaceNumber,
-					 buff, sizeof(buff), &lengthTransferred);
-		if(!retValue)
-		{
-	        m_errorCode = GetLastErrorInternal();
-#ifdef _ENABLE_TRACE
-		    debugPrintf("ASIOUAC: Enumerate samplerate failed. ErrorCode: %08Xh\n",  m_errorCode);
-#endif
-		}
-		else
-			if(lengthTransferred <= 2)
-			{
-#ifdef _ENABLE_TRACE
-				debugPrintf("ASIOUAC: Enumerate samplerate failed. Wrong transfer length\n");
-#endif
-				retValue = FALSE;
-			}
-		unsigned short length = *((unsigned short*)buff);
-		struct sample_rate_triplets *triplets = (sample_rate_triplets *)(buff + 2);
 
-#ifdef _ENABLE_TRACE
-		//debugPrintf("ASIOUAC: Enumerate samplerate OK\n");
-#endif
-		for(int i = 0; i < length; i++)
-		{
-			if(triplets[i].res_freq == 0)
-			{
-				if(newfreq == triplets[i].min_freq)
-					retVal = TRUE;
-			}
-			else
-				for(int freq = triplets[i].min_freq; freq <= triplets[i].max_freq; freq += triplets[i].res_freq)
-				{
-#ifdef _ENABLE_TRACE
-					//debugPrintf("ASIOUAC: Supported freq: %d\n", freq);
-#endif
-					if(newfreq == freq)
-						retVal = TRUE;
-				}
-		}
-		UsbReleaseInterface(clocksrc->m_interface->Descriptor().bInterfaceNumber);
+	switch (newfreq)
+	{
+	case 44100:
+	case 48000:
+//	case 88200:
+	case 96000:
+		retVal = TRUE;
+		break;
+	default:
+		break;
+	}
+
 #ifdef _ENABLE_TRACE
 		debugPrintf("ASIOUAC: Sample freq: %d %s\n", newfreq, retVal ? "is supported" : "isn't supported");
 #endif
-	}
-	else
-	{
-        m_errorCode = GetLastErrorInternal();
-#ifdef _ENABLE_TRACE
-        debugPrintf("ASIOUAC: Claim interface %d failed. ErrorCode: %08Xh\n", clocksrc->m_interface->Descriptor().bInterfaceNumber, m_errorCode);
-#endif
-	}
+
 	return retVal;
 }
+
+USBFirmwareEndpoint* USBAudioDevice::FindFWDest()
+{
+	USBFirmwareInterface * iface = m_fwInterfaceList.First();
+
+	while(iface)
+	{
+		if (iface->m_endpointsList.Count())
+		{
+			USBFirmwareEndpoint *ep;
+			ep = iface->m_endpointsList.First();
+			while(ep)
+			{
+				if (ep->m_descriptor.bEndpointAddress == 1)
+					return ep;
+				ep = iface->m_endpointsList.Next(ep);
+			}
+		}
+		iface = m_fwInterfaceList.Next(iface);
+	}
+	return NULL;
+}
+
+
+
+
+USBFirmwareEndpoint* USBAudioDevice::FindFWEndpoint( int Addr )
+{
+	USBFirmwareInterface * iface = m_fwInterfaceList.First();
+
+	while(iface)
+	{
+		if (iface->m_endpointsList.Count())
+		{
+			USBFirmwareEndpoint *ep;
+			ep = iface->m_endpointsList.First();
+			while(ep)
+			{
+				if (ep->m_descriptor.bEndpointAddress == Addr)
+					return ep;
+				ep = iface->m_endpointsList.Next(ep);
+			}
+		}
+		iface = m_fwInterfaceList.Next(iface);
+	}
+	return NULL;
+}
+
+
+
+
 
 USBAudioClockSource* USBAudioDevice::FindClockSource(int freq)
 {
@@ -363,103 +779,90 @@ USBAudioClockSource* USBAudioDevice::FindClockSource(int freq)
 
 bool USBAudioDevice::SetSampleRateInternal(int freq)
 {
-	UINT lengthTransferred = 0;
-	bool retValue = FALSE;
-	USBAudioClockSource* clockSource = FindClockSource(freq);
-	if(!clockSource)
+	bool retVal = FALSE;
+
+	retVal = TRUE;
+	switch (freq)
 	{
-#ifdef _ENABLE_TRACE
-        debugPrintf("ASIOUAC: Not found clock source for sample rate %d\n", freq);
-#endif
-		return FALSE;
+	case 44100:
+		m_cmd2Pckt.Byte0 &= 0xFB;
+		m_cmd2Pckt.Byte0 |= 0x00;
+		m_cmd2Pckt.Byte2 &= 0xCF;
+		m_cmd2Pckt.Byte2 |= 0x00;
+		break;
+
+	case 48000:
+		m_cmd2Pckt.Byte0 &= 0xFB;
+		m_cmd2Pckt.Byte0 |= 0x04;
+		m_cmd2Pckt.Byte2 &= 0xCF;
+		m_cmd2Pckt.Byte2 |= 0x10;
+		break;
+
+	case 88200:
+		m_cmd2Pckt.Byte0 &= 0xFB;
+		m_cmd2Pckt.Byte0 |= 0x0C;
+		m_cmd2Pckt.Byte2 &= 0xCF;
+		m_cmd2Pckt.Byte2 |= 0x20;
+		break;
+
+	case 96000:
+		m_cmd2Pckt.Byte0 &= 0xFB;
+		m_cmd2Pckt.Byte0 |= 0x0C;
+		m_cmd2Pckt.Byte2 &= 0xCF;
+		m_cmd2Pckt.Byte2 |= 0x30;
+		break;
+
+	default:
+		retVal = FALSE;
+		break;
 	}
 
-	if(UsbClaimInterface(clockSource->m_interface->Descriptor().bInterfaceNumber))
-	{
-		retValue = SendUsbControl(BMREQUEST_DIR_HOST_TO_DEVICE, BMREQUEST_TYPE_CLASS, BMREQUEST_RECIPIENT_INTERFACE, 
-			AUDIO_CS_REQUEST_CUR, AUDIO_CS_CONTROL_SAM_FREQ << 8, (clockSource->m_clockSource.bClockID << 8) + clockSource->m_interface->Descriptor().bInterfaceNumber,
-					(unsigned char*)&freq, sizeof(freq), &lengthTransferred);
-		if(!retValue)
-		{
-	        m_errorCode = GetLastErrorInternal();
+	if (m_adc)
+		m_adc->SetSampleFreq( freq );
+
+	if (m_dac)
+		m_dac->SetSampleFreq( freq );
+
+	PostBCAControl02( m_cmd2Pckt.Byte0, m_cmd2Pckt.Byte1, m_cmd2Pckt.Byte2, m_cmd2Pckt.Byte3 );
+
 #ifdef _ENABLE_TRACE
-		    debugPrintf("ASIOUAC: Set samplerate %d failed. ErrorCode: %08Xh\n",  freq, m_errorCode);
+		debugPrintf("ASIOUAC: Sample freq: %d %s\n", freq, retVal ? "is supported" : "isn't supported");
 #endif
-		}
-		else
-			if(lengthTransferred != 4)
-			{
-#ifdef _ENABLE_TRACE
-				debugPrintf("ASIOUAC: Set samplerate %d failed. Wrong transfer length\n",  freq);
-#endif
-				retValue = FALSE;
-			}
-		UsbReleaseInterface(clockSource->m_interface->Descriptor().bInterfaceNumber);
-	}
-	else
-	{
-        m_errorCode = GetLastErrorInternal();
-#ifdef _ENABLE_TRACE
-        debugPrintf("ASIOUAC: Claim interface %d failed. ErrorCode: %08Xh\n", clockSource->m_interface->Descriptor().bInterfaceNumber, m_errorCode);
-#endif
-	}
-	return retValue;
+
+	return retVal;
 }
 
 int USBAudioDevice::GetCurrentSampleRate()
 {
+	int Res = 48000;
+
 	if(!IsValidDevice())
 		return 0;
 
-	if(m_acInterfaceList.Count() == 1 && m_acInterfaceList.First()->m_clockSourceList.Count() == 1)
+	switch (m_cmd2Pckt.Byte2 & 0x30)
 	{
-		int acInterfaceNum = m_acInterfaceList.First()->Descriptor().bInterfaceNumber;
-		int clockID = m_acInterfaceList.First()->m_clockSourceList.First()->m_clockSource.bClockID;
-		return GetSampleRateInternal(acInterfaceNum, clockID);
-	}
-	else
-	{
-		//more AC interfaces???
+	case 0x00:
+		Res = 44100;
+		break;
+	case 0x01:
+		Res = 48000;
+		break;
+	case 0x02:
+		Res = 88200;
+		break;
+	case 0x03:
+		Res = 96000;
+		break;
+	default:
+		break;
 	}
 
-	return 0;
+	return Res;
 }
 
 int USBAudioDevice::GetSampleRateInternal(int interfaceNum, int clockID)
 {
-	UINT lengthTransferred = 0;
-	int freq = 0;
-
-	if(UsbClaimInterface(interfaceNum))
-	{
-		if(!SendUsbControl( BMREQUEST_DIR_DEVICE_TO_HOST, BMREQUEST_TYPE_CLASS, BMREQUEST_RECIPIENT_INTERFACE, 
-					AUDIO_CS_REQUEST_CUR, AUDIO_CS_CONTROL_SAM_FREQ << 8, (clockID << 8) + interfaceNum,
-					(unsigned char*)&freq, sizeof(freq), &lengthTransferred))
-		{
-			freq = 0;
-	        m_errorCode = GetLastErrorInternal();
-#ifdef _ENABLE_TRACE
-		    debugPrintf("ASIOUAC: Get samplerate %d failed. ErrorCode: %08Xh\n",  freq, m_errorCode);
-#endif
-		}
-		else
-			if(lengthTransferred != 4)
-			{
-#ifdef _ENABLE_TRACE
-				debugPrintf("ASIOUAC: Get samplerate %d failed. Wrong transfer length\n",  freq);
-#endif
-				freq = 0;
-			}
-		UsbReleaseInterface(interfaceNum);
-	}
-	else
-	{
-        m_errorCode = GetLastErrorInternal();
-#ifdef _ENABLE_TRACE
-        debugPrintf("ASIOUAC: Claim interface %d failed. ErrorCode: %08Xh\n", interfaceNum, m_errorCode);
-#endif
-	}
-	return freq;
+	return 48000;
 }
 
 bool USBAudioDevice::SetSampleRate(int freq)
@@ -472,10 +875,6 @@ bool USBAudioDevice::SetSampleRate(int freq)
 #endif
 	if(SetSampleRateInternal(freq))
 	{
-		if(m_adc != NULL)
-			m_adc->SetSampleFreq(freq);
-		if(m_dac != NULL)
-			m_dac->SetSampleFreq(freq);
 		return TRUE;
 	}
 	return FALSE;
@@ -485,7 +884,8 @@ bool USBAudioDevice::CanSampleRate(int freq)
 {
 	if(!IsValidDevice())
 		return FALSE;
-	return 	FindClockSource(freq) != NULL;
+
+	return(CheckSampleRate(NULL, freq));
 }
 
 
@@ -500,6 +900,17 @@ bool USBAudioDevice::Start()
 	debugPrintf("ASIOUAC: USBAudioDevice start\n");
 #endif
 
+
+	// NOTE:
+	// MUST be reading status, else it won't start up tx!!!!
+	if (m_fbEndpoint)
+	{
+		if(m_feedback != NULL)
+			retVal &= m_feedback->Start();
+	}
+
+	Sleep(500);
+
 	if(m_adcEndpoint)
 	{
 		UsbClaimInterface(m_adcEndpoint->m_interface->Descriptor().bInterfaceNumber);
@@ -512,6 +923,7 @@ bool USBAudioDevice::Start()
 			retVal &= m_adc->Start();
 	}
 
+
 	if(m_dacEndpoint)
 	{
 		UsbClaimInterface(m_dacEndpoint->m_interface->Descriptor().bInterfaceNumber);
@@ -523,9 +935,13 @@ bool USBAudioDevice::Start()
 		if(m_dac != NULL)
 			retVal &= m_dac->Start();
 
-		if(m_feedback != NULL)
-			retVal &= m_feedback->Start();
 	}
+
+
+//	unsigned char tmp[20] = { 0, 0, 5, 0, 0, 0 };
+//	PostBCACmd( 0x07, 0, tmp, 6 );
+
+
 	m_isStarted = TRUE;
 	return retVal;
 }
@@ -623,14 +1039,14 @@ int USBAudioDevice::GetInputChannelNumber()
 {
 	if(!IsValidDevice())
 		return 0;
-	return m_useInput ? 2 : 0;
+	return m_useInput ? 8 : 0;
 }
 
 int USBAudioDevice::GetOutputChannelNumber()
 {
 	if(!IsValidDevice())
 		return 0;
-	return 2;
+	return 8;
 }
 
 USBAudioInTerminal* USBAudioDevice::FindInTerminal(int id)

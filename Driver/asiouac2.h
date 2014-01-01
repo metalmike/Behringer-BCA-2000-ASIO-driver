@@ -55,6 +55,8 @@ public:
 	AsioUAC2(LPUNKNOWN pUnk, HRESULT *phr);
 	~AsioUAC2();
 
+	static void *TheOneInstance;
+
 	DECLARE_IUNKNOWN
     //STDMETHODIMP QueryInterface(REFIID riid, void **ppv) {      \
     //    return GetOwner()->QueryInterface(riid,ppv);            \

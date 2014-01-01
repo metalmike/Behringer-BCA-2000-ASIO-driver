@@ -64,6 +64,68 @@ bool USBAudioStreamingEndpoint::SetCSDescriptor(USB_DESCRIPTOR_HEADER *csDescrip
 	return FALSE;
 }
 
+USBFirmwareEndpoint::USBFirmwareEndpoint(USB_ENDPOINT_DESCRIPTOR* descriptor, USBFirmwareInterface* iface) : USBEndpoint(descriptor), m_interface(iface)
+{
+	memcpy(&m_descriptor, descriptor, sizeof(USB_ENDPOINT_DESCRIPTOR));
+}
+
+bool USBFirmwareEndpoint::SetCSDescriptor(USB_DESCRIPTOR_HEADER *csDescriptor)
+{
+	if(csDescriptor->bDescriptorSubType == GENERAL_SUB_TYPE && csDescriptor->bLength == sizeof(USB_ENDPOINT_DESCRIPTOR))
+	{
+		memcpy(&m_descriptor, csDescriptor, sizeof(USB_ENDPOINT_DESCRIPTOR));
+#ifdef _ENABLE_TRACE
+		debugPrintf("ASIOUAC: Found CS descriptor for endpoint 0x%X, audio streaming interface 0x%X\n", m_descriptor.bEndpointAddress, m_interface->Descriptor().bInterfaceNumber);
+#endif
+		return TRUE;
+	}
+	return FALSE;
+}
+
+
+
+
+
+
+
+USBFirmwareInterface::USBFirmwareInterface(USB_INTERFACE_DESCRIPTOR* iface) : USBAudioInterface(iface) 
+{
+	memset(&m_asgDescriptor, 0, sizeof(usb_as_g_interface_descriptor_2));
+	memset(&m_formatDescriptor, 0, sizeof(usb_format_type_2));
+}
+
+bool USBFirmwareInterface::SetCSDescriptor(USB_DESCRIPTOR_HEADER* csDescriptor)
+{
+	switch(csDescriptor->bDescriptorSubType)
+	{
+		case HEADER_SUB_TYPE:			
+			memcpy(&m_asgDescriptor, csDescriptor, sizeof(usb_as_g_interface_descriptor_2));
+#ifdef _ENABLE_TRACE
+			debugPrintf("ASIOUAC: Found CS descriptor (subtype 0x%X) for audio streaming interface 0x%X\n", m_interface.bInterfaceSubClass, m_interface.bInterfaceNumber);
+#endif
+			return TRUE;
+		case FORMAT_SUB_TYPE:			
+			memcpy(&m_formatDescriptor, csDescriptor, sizeof(usb_format_type_2));
+#ifdef _ENABLE_TRACE
+			debugPrintf("ASIOUAC: Found format type descriptor for audio streaming interface 0x%X\n", m_interface.bInterfaceNumber);
+#endif
+			return TRUE;
+	}
+	return FALSE;
+}
+
+USBEndpoint* USBFirmwareInterface::CreateEndpoint(USB_ENDPOINT_DESCRIPTOR* descriptor)
+{
+	USBFirmwareEndpoint *ep = new USBFirmwareEndpoint(descriptor, this);
+#ifdef _ENABLE_TRACE
+	debugPrintf("ASIOUAC: Found endpoint 0x%X for audio streaming interface 0x%X\n", ep->m_descriptor.bEndpointAddress, m_interface.bInterfaceNumber);
+#endif
+	m_endpointsList.Add(ep);
+	return ep;
+}
+
+
+
 USBAudioControlInterface::USBAudioControlInterface(USB_INTERFACE_DESCRIPTOR*	iface) : USBAudioInterface(iface) 
 {
 	memset(&m_acDescriptor, 0, sizeof(usb_ac_interface_descriptor_2));
