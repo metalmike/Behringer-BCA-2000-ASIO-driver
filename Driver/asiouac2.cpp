@@ -1031,7 +1031,7 @@ template <typename T_SRC, typename T_DST> void AsioUAC2::FillOutputData(UCHAR *b
 		for (int chan = 0; chan < 8; chan++)
 		{
 			if (hostBuffers[chan])
-				sampleBuff[i].Chan[chan] = hostBuffers[chan][currentInBufferPosition];
+				sampleBuff[i].Chan[chan] = hostBuffers[chan][currentOutBufferPosition];// & 0xffffff00;
 			else
 				sampleBuff[i].Chan[chan] = 0;
 		}

@@ -412,8 +412,14 @@ int AudioDACTask::FillBuffer(ISOBuffer* nextXfer)
 
 		dataLength = (int)nextOffSet;
 
-		if(m_readDataCb)
+		if (m_readDataCb && (m_TotalWrites > MAX_OUTSTANDING_TRANSFERS))
+		{
 			m_readDataCb(m_readDataCbContext, nextXfer->DataBuffer, dataLength);
+		}
+		else
+		{
+			memset( nextXfer->DataBuffer, 0, dataLength);
+		}
 
 #ifdef _ENABLE_TRACE
 		//You can dump data for analise like this
