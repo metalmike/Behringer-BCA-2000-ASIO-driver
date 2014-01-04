@@ -161,7 +161,7 @@ public:
 	}
 	int GetDACBitResolution()
 	{
-		return 32;
+		return 24;
 	}
 	int GetADCBitResolution()
 	{

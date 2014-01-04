@@ -929,12 +929,12 @@ struct ThreeByteSample
 		sample[1] = *(ptrVal+1);
 		sample[2] = *(ptrVal+2);
 	}
-/*
+
 	operator int()const
 	{
 		return (sample[0]) + (sample[1] << 8) + (sample[2] << 16);
 	}
-*/
+
 };
 
 #define FourByteSample	int
@@ -976,25 +976,47 @@ struct Audio8Chan
 	FourByteSample Chan[8];
 };
 
+#define htonl(A) ( \
+(((unsigned long)(A) & 0xff000000) >> 24) | \
+(((unsigned long)(A) & 0x00ff0000) >> 8) | \
+(((unsigned long)(A) & 0x0000ff00) << 8) | \
+(((unsigned long)(A) & 0x000000ff) << 24) \
+)
+
 
 template <typename T_SRC, typename T_DST> void AsioUAC2::FillOutputData(UCHAR *buffer, int& len)
 {
 	if(activeOutputs == 0 || m_StopInProgress)
 	{
+		if(m_StopInProgress)
+		{
 #ifdef _ENABLE_TRACE
-		debugPrintf("ASIOUAC: Detected exit flag in output thread!\n");
-#endif
-		len = 0;
+			debugPrintf("ASIOUAC: Detected exit flag in output thread!\n");
+#endif	
+		}
+		// provide an empty buffer for output
+		memset( buffer, 0, len ); 
+		//len = 0;
 		return;
 	}
-	T_DST *sampleBuff = (T_DST *)buffer;
-	int sampleLength = len / sizeof(T_DST);
+
+	Audio8Chan *sampleBuff = (Audio8Chan *)buffer;
+
+	//T_DST *sampleBuff = (T_DST *)buffer;
+	int sampleLength = len / sizeof(Audio8Chan);
 #ifdef _ENABLE_TRACE
 	//debugPrintf("ASIOUAC: Fill output data with length %d, currentBufferPosition %d", sampleLength, currentOutBufferPosition);
 #endif
 
-	T_SRC *hostBuffer0 = toggle ? ((T_SRC*)outputBuffers[0]) + blockFrames : (T_SRC*)outputBuffers[0];
-	T_SRC *hostBuffer1 = toggle ? ((T_SRC*)outputBuffers[1]) + blockFrames : (T_SRC*)outputBuffers[1];
+	T_SRC *hostBuffers[8];
+	for (int chan = 0; chan < 8; chan++)
+	{
+		if (outputBuffers[chan])
+			hostBuffers[chan] = toggle ? ((T_SRC*)outputBuffers[chan]) + blockFrames : (T_SRC*)outputBuffers[chan];
+		else
+			hostBuffers[chan] = NULL;
+
+	}
 
 	for(int i = 0; i < sampleLength; i++)
 	{
@@ -1006,8 +1028,13 @@ template <typename T_SRC, typename T_DST> void AsioUAC2::FillOutputData(UCHAR *b
 			return;
 		}
 
-		sampleBuff[i].left =  hostBuffer0[currentOutBufferPosition];
-		sampleBuff[i].right = hostBuffer1[currentOutBufferPosition];
+		for (int chan = 0; chan < 8; chan++)
+		{
+			if (hostBuffers[chan])
+				sampleBuff[i].Chan[chan] = hostBuffers[chan][currentInBufferPosition];
+			else
+				sampleBuff[i].Chan[chan] = 0;
+		}
 
 		currentOutBufferPosition ++;
 		if(currentOutBufferPosition == blockFrames)
@@ -1032,8 +1059,15 @@ template <typename T_SRC, typename T_DST> void AsioUAC2::FillOutputData(UCHAR *b
 				return;
 			}
 			bufferSwitch ();
-			hostBuffer0 = toggle ? ((T_SRC*)outputBuffers[0]) + blockFrames : (T_SRC*)outputBuffers[0];
-			hostBuffer1 = toggle ? ((T_SRC*)outputBuffers[1]) + blockFrames : (T_SRC*)outputBuffers[1];
+
+			for (int chan = 0; chan < 8; chan++)
+			{
+				if (outputBuffers[chan])
+					hostBuffers[chan] = toggle ? ((T_SRC*)outputBuffers[chan]) + blockFrames : (T_SRC*)outputBuffers[chan];
+				else
+					hostBuffers[chan] = NULL;
+
+			}
 		}
 	}
 }
@@ -1073,12 +1107,6 @@ template <typename T_SRC, typename T_DST> void AsioUAC2::FillInputData(UCHAR *bu
 #endif
 		}
 
-#define htonl(A) ( \
-(((unsigned long)(A) & 0xff000000) >> 24) | \
-(((unsigned long)(A) & 0x00ff0000) >> 8) | \
-(((unsigned long)(A) & 0x0000ff00) << 8) | \
-(((unsigned long)(A) & 0x000000ff) << 24) \
-)
 
 		for (int chan = 0; chan < 8; chan++)
 		{
@@ -1091,7 +1119,7 @@ template <typename T_SRC, typename T_DST> void AsioUAC2::FillInputData(UCHAR *bu
 		{
 			currentInBufferPosition = 0;
 			//need syncro with output buffer
-			if(activeOutputs && 0)
+			if(activeOutputs && m_AsioSyncEvent)
 			{
 				//inform output thread
 				SetEvent(m_AsioSyncEvent);
@@ -1151,7 +1179,8 @@ void AsioUAC2::sFillInputData3(void* context, UCHAR *buffer, int& len)
 void AsioUAC2::sFillOutputData4(void* context, UCHAR *buffer, int& len)
 {
 	if(context)
-		((AsioUAC2*)context)->FillOutputData<FourByteSample,AudioSample4>(buffer, len);
+//		((AsioUAC2*)context)->FillOutputData<FourByteSample,AudioSample4>(buffer, len);
+		((AsioUAC2*)context)->FillOutputData<FourByteSample,Audio8Chan>(buffer, len);
 }
 
 void AsioUAC2::sFillInputData4(void* context, UCHAR *buffer, int& len)
